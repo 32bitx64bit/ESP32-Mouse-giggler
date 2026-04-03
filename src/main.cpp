@@ -1,22 +1,22 @@
 #include <Arduino.h>
+#include <NimBLEDevice.h>
+#include <NimBLEHIDDevice.h>
 #include <Preferences.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 #include <esp_bt.h>
-#include <esp_gap_ble_api.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BleMouse.h>
+#include <esp_system.h>
 #include <M5Unified.h>
 
 namespace {
 
 constexpr uint32_t kActiveLoopDelayMs = 20;
 constexpr uint32_t kIdleLoopDelayMs = 100;
-constexpr uint32_t kDimmedLoopDelayMs = 300;
+constexpr uint32_t kDimmedLoopDelayMs = 60;
 constexpr uint32_t kPairHoldMs = 2000;
 constexpr uint32_t kPairingWindowMs = 60000;
 constexpr uint32_t kPairingLockDelayMs = 3000;
+constexpr uint32_t kSecurityHandshakeTimeoutMs = 15000;
 constexpr uint32_t kGiggleIntervalMs = 15000;
 constexpr uint32_t kReturnMoveDelayMs = 120;
 constexpr uint32_t kUiRefreshMs = 1000;
@@ -43,6 +43,12 @@ constexpr float kBatteryFallFilterAlpha = 0.35f;
 constexpr int8_t kGigglePixels = 1;
 constexpr uint8_t kScreenBrightLevel = 96;
 constexpr uint8_t kScreenDimLevel = 8;
+constexpr int8_t kBleTxPowerDbm = 0;
+constexpr uint16_t kBleAppearanceMouse = 0x03C2;
+constexpr uint16_t kBleConnIntervalMin = 24;
+constexpr uint16_t kBleConnIntervalMax = 48;
+constexpr uint16_t kBleConnLatency = 4;
+constexpr uint16_t kBleConnTimeout = 200;
 
 struct BatteryCurvePoint {
   int16_t voltageMv;
@@ -83,64 +89,283 @@ bool timeReached(const uint32_t now, const uint32_t target) {
   return static_cast<int32_t>(now - target) >= 0;
 }
 
-class ManagedBleMouse : public BleMouse {
+constexpr uint8_t kMouseReportDescriptor[] = {
+    0x05, 0x01,        // USAGE_PAGE (Generic Desktop)
+    0x09, 0x02,        // USAGE (Mouse)
+    0xA1, 0x01,        // COLLECTION (Application)
+    0x09, 0x01,        //   USAGE (Pointer)
+    0xA1, 0x00,        //   COLLECTION (Physical)
+    0x05, 0x09,        //     USAGE_PAGE (Button)
+    0x19, 0x01,        //     USAGE_MINIMUM (Button 1)
+    0x29, 0x05,        //     USAGE_MAXIMUM (Button 5)
+    0x15, 0x00,        //     LOGICAL_MINIMUM (0)
+    0x25, 0x01,        //     LOGICAL_MAXIMUM (1)
+    0x75, 0x01,        //     REPORT_SIZE (1)
+    0x95, 0x05,        //     REPORT_COUNT (5)
+    0x81, 0x02,        //     INPUT (Data,Var,Abs)
+    0x75, 0x03,        //     REPORT_SIZE (3)
+    0x95, 0x01,        //     REPORT_COUNT (1)
+    0x81, 0x03,        //     INPUT (Const,Var,Abs)
+    0x05, 0x01,        //     USAGE_PAGE (Generic Desktop)
+    0x09, 0x30,        //     USAGE (X)
+    0x09, 0x31,        //     USAGE (Y)
+    0x09, 0x38,        //     USAGE (Wheel)
+    0x15, 0x81,        //     LOGICAL_MINIMUM (-127)
+    0x25, 0x7F,        //     LOGICAL_MAXIMUM (127)
+    0x75, 0x08,        //     REPORT_SIZE (8)
+    0x95, 0x03,        //     REPORT_COUNT (3)
+    0x81, 0x06,        //     INPUT (Data,Var,Rel)
+    0x05, 0x0C,        //     USAGE_PAGE (Consumer)
+    0x0A, 0x38, 0x02,  //     USAGE (AC Pan)
+    0x15, 0x81,        //     LOGICAL_MINIMUM (-127)
+    0x25, 0x7F,        //     LOGICAL_MAXIMUM (127)
+    0x75, 0x08,        //     REPORT_SIZE (8)
+    0x95, 0x01,        //     REPORT_COUNT (1)
+    0x81, 0x06,        //     INPUT (Data,Var,Rel)
+    0xC0,              //   END_COLLECTION
+    0xC0,              // END_COLLECTION
+};
+
+class ManagedBleMouse {
  public:
-  ManagedBleMouse()
-    : BleMouse("M5StickC Plus2 Giggler", "M5Stack", 100) {
+  ManagedBleMouse() = default;
+
+  void begin() {
+    NimBLEDevice::init("M5StickC Plus2 Giggler");
+    NimBLEDevice::setPower(kBleTxPowerDbm);
+    NimBLEDevice::setSecurityAuth(true, false, true);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
+
+    server_ = NimBLEDevice::createServer();
+    server_->setCallbacks(&serverCallbacks_, false);
+    server_->advertiseOnDisconnect(false);
+
+    hid_ = new NimBLEHIDDevice(server_);
+    hid_->setManufacturer("M5Stack");
+    hid_->setPnp(0x02, 0xE502, 0xA111, 0x0210);
+    hid_->setHidInfo(0x00, 0x02);
+    hid_->setReportMap(const_cast<uint8_t*>(kMouseReportDescriptor),
+                       sizeof(kMouseReportDescriptor));
+    inputReport_ = hid_->getInputReport(0);
+    inputReport_->setCallbacks(&inputCallbacks_);
+    hid_->setBatteryLevel(batteryLevel_);
+
+    server_->start();
+
+    advertisingInstance_ = NimBLEDevice::getAdvertising();
+    advertisingInstance_->setName("M5StickC Plus2 Giggler");
+    advertisingInstance_->setAppearance(kBleAppearanceMouse);
+    advertisingInstance_->addServiceUUID(hid_->getHidService()->getUUID());
+    advertisingInstance_->setPreferredParams(kBleConnIntervalMin,
+                                             kBleConnIntervalMax);
+    advertisingInstance_->enableScanResponse(false);
+
+    ready_ = true;
   }
 
   bool ready() const {
-    return server_ != nullptr;
+    return ready_;
   }
 
   bool advertising() const {
     return advertising_;
   }
 
+  bool hasLink() const {
+    return linkConnected_;
+  }
+
+  bool bonded() const {
+    return bonded_;
+  }
+
+  bool secure() const {
+    return encrypted_ && bonded_;
+  }
+
+  bool isConnected() const {
+    return linkConnected_ && subscribed_ && secure();
+  }
+
+  uint32_t passkey() const {
+    return passkey_;
+  }
+
+  void setPasskey(const uint32_t passkey) {
+    passkey_ = passkey;
+  }
+
   void restartAdvertising() {
-    if (!server_) {
+    if (!ready_) {
       return;
     }
 
-    auto* advertising = server_->getAdvertising();
-    if (!advertising) {
+    if (!advertisingInstance_) {
       return;
     }
 
-    advertising->stop();
-    delay(50);
-    advertising->start();
-    advertising_ = true;
+    advertisingInstance_->stop();
+    delay(20);
+    advertising_ = advertisingInstance_->start();
   }
 
   void setAdvertising(const bool enabled) {
-    if (!server_) {
-      return;
-    }
-
-    auto* advertising = server_->getAdvertising();
-    if (!advertising) {
+    if (!ready_ || !advertisingInstance_) {
       return;
     }
 
     if (enabled) {
-      advertising->start();
+      advertising_ = advertisingInstance_->start();
     } else {
-      advertising->stop();
+      advertisingInstance_->stop();
+      advertising_ = false;
     }
-
-    advertising_ = enabled;
   }
 
- protected:
-  void onStarted(BLEServer* server) override {
-    server_ = server;
-    advertising_ = true;
+  void disconnect() {
+    if (server_ && connHandle_ != BLE_HS_CONN_HANDLE_NONE) {
+      server_->disconnect(connHandle_);
+    }
+  }
+
+  void setBatteryLevel(const uint8_t level, const bool notify = false) {
+    batteryLevel_ = level;
+    if (hid_) {
+      hid_->setBatteryLevel(level, notify);
+    }
+  }
+
+  bool move(const int8_t x, const int8_t y, const int8_t wheel = 0,
+            const int8_t hWheel = 0) {
+    if (!isConnected() || inputReport_ == nullptr) {
+      return false;
+    }
+
+    const uint8_t report[5] = {
+        buttons_,
+        static_cast<uint8_t>(x),
+        static_cast<uint8_t>(y),
+        static_cast<uint8_t>(wheel),
+        static_cast<uint8_t>(hWheel),
+    };
+
+    return inputReport_->notify(report, sizeof(report), connHandle_);
   }
 
  private:
-  BLEServer* server_ = nullptr;
+  class ServerCallbacks : public NimBLEServerCallbacks {
+   public:
+    explicit ServerCallbacks(ManagedBleMouse& owner) : owner_(owner) {
+    }
+
+    void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
+      owner_.handleConnect(server, connInfo);
+    }
+
+    void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo,
+                      const int reason) override {
+      owner_.handleDisconnect(server, connInfo, reason);
+    }
+
+    uint32_t onPassKeyDisplay() override {
+      return owner_.passkey_;
+    }
+
+    void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
+      owner_.handleAuthenticationComplete(connInfo);
+    }
+
+   private:
+    ManagedBleMouse& owner_;
+  };
+
+  class InputCallbacks : public NimBLECharacteristicCallbacks {
+   public:
+    explicit InputCallbacks(ManagedBleMouse& owner) : owner_(owner) {
+    }
+
+    void onSubscribe(NimBLECharacteristic* characteristic,
+                     NimBLEConnInfo& connInfo, const uint16_t subValue) override {
+      (void)characteristic;
+      owner_.handleSubscribe(connInfo, subValue);
+    }
+
+   private:
+    ManagedBleMouse& owner_;
+  };
+
+  void resetSessionState() {
+    connHandle_ = BLE_HS_CONN_HANDLE_NONE;
+    linkConnected_ = false;
+    encrypted_ = false;
+    authenticated_ = false;
+    bonded_ = false;
+    subscribed_ = false;
+  }
+
+  void refreshSecurityState(const NimBLEConnInfo& connInfo) {
+    const NimBLEAddress idAddress = connInfo.getIdAddress();
+    encrypted_ = connInfo.isEncrypted();
+    authenticated_ = connInfo.isAuthenticated();
+    bonded_ = connInfo.isBonded() ||
+              (!idAddress.isNull() && NimBLEDevice::isBonded(idAddress)) ||
+              NimBLEDevice::isBonded(connInfo.getAddress());
+  }
+
+  void handleConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) {
+    connHandle_ = connInfo.getConnHandle();
+    linkConnected_ = true;
+    subscribed_ = false;
+    refreshSecurityState(connInfo);
+    advertising_ = true;
+    server->updateConnParams(connHandle_, kBleConnIntervalMin,
+                             kBleConnIntervalMax, kBleConnLatency,
+                             kBleConnTimeout);
+    NimBLEDevice::startSecurity(connHandle_);
+  }
+
+  void handleDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo,
+                        const int reason) {
+    (void)server;
+    (void)connInfo;
+    (void)reason;
+    advertising_ = false;
+    resetSessionState();
+  }
+
+  void handleAuthenticationComplete(NimBLEConnInfo& connInfo) {
+    refreshSecurityState(connInfo);
+    if (!secure()) {
+      disconnect();
+    }
+  }
+
+  void handleSubscribe(NimBLEConnInfo& connInfo, const uint16_t subValue) {
+    if (connInfo.getConnHandle() != connHandle_) {
+      return;
+    }
+
+    subscribed_ = (subValue & 0x0001U) != 0;
+    refreshSecurityState(connInfo);
+  }
+
+  NimBLEServer* server_ = nullptr;
+  NimBLEHIDDevice* hid_ = nullptr;
+  NimBLEAdvertising* advertisingInstance_ = nullptr;
+  NimBLECharacteristic* inputReport_ = nullptr;
+  ServerCallbacks serverCallbacks_{*this};
+  InputCallbacks inputCallbacks_{*this};
+  uint16_t connHandle_ = BLE_HS_CONN_HANDLE_NONE;
+  uint8_t buttons_ = 0;
+  uint8_t batteryLevel_ = 100;
+  uint32_t passkey_ = 123456;
+  bool ready_ = false;
   bool advertising_ = false;
+  bool linkConnected_ = false;
+  bool encrypted_ = false;
+  bool authenticated_ = false;
+  bool bonded_ = false;
+  bool subscribed_ = false;
 };
 
 ManagedBleMouse bleMouse;
@@ -150,8 +375,8 @@ Preferences preferences;
 bool gigglerEnabled = false;
 bool pairingMode = false;
 bool displayDirty = true;
-bool initialAdvertisingStopped = false;
 bool wasConnected = false;
+bool wasLinkConnected = false;
 bool returnMovePending = false;
 bool screenDimmed = false;
 bool ignoreNextAClick = false;
@@ -165,6 +390,7 @@ uint32_t returnMoveMs = 0;
 uint32_t nextUiRefreshMs = 0;
 uint32_t lastUserActivityMs = 0;
 uint32_t nextBatterySampleMs = 0;
+uint32_t securityHandshakeDeadlineMs = 0;
 
 BatteryStatus batteryStatus;
 BatteryCalibration batteryCalibration;
@@ -407,26 +633,18 @@ void refreshBatteryStatus(const uint32_t now, const bool force = false) {
 
   batteryStatus.voltageMv = batteryVoltageMv;
   batteryStatus.usbPowered = usbPowered;
+  if (bleMouse.ready() && batteryStatus.level >= 0) {
+    bleMouse.setBatteryLevel(static_cast<uint8_t>(constrain(batteryStatus.level, 0L, 100L)));
+  }
   nextBatterySampleMs = now + kBatterySampleMs;
 }
 
 void clearBondedDevices() {
-  const int bondCount = esp_ble_get_bond_device_num();
-  if (bondCount <= 0) {
-    return;
-  }
-
-  constexpr int kMaxBondDevices = 15;
-  esp_ble_bond_dev_t bondedDevices[kMaxBondDevices];
-  int deviceCount = min(bondCount, kMaxBondDevices);
-  if (esp_ble_get_bond_device_list(&deviceCount, bondedDevices) == ESP_OK) {
-    for (int i = 0; i < deviceCount; ++i) {
-      esp_ble_remove_bond_device(bondedDevices[i].bd_addr);
-    }
-  }
+  NimBLEDevice::deleteAllBonds();
 }
 
 [[noreturn]] void resetPairingAndRestart() {
+  bleMouse.disconnect();
   bleMouse.setAdvertising(false);
   clearBondedDevices();
   delay(250);
@@ -523,6 +741,7 @@ void drawStatus() {
 
   const uint32_t now = millis();
   const bool connected = bleMouse.isConnected();
+  const bool linkConnected = bleMouse.hasLink();
   const uint32_t pairRemainingMs =
       (pairingMode && !timeReached(now, pairingDeadlineMs))
           ? (pairingDeadlineMs - now)
@@ -549,11 +768,16 @@ void drawStatus() {
   drawBatteryWidget(186, 8, batteryStatus.level, batteryStatus.voltageMv,
                     batteryStatus.usbPowered);
 
-  drawCard(8, 42, 108, 42, "Bluetooth", connected ? TFT_GREEN : (pairingMode ? TFT_YELLOW : TFT_DARKGREY));
+  drawCard(8, 42, 108, 42, "Bluetooth",
+           connected ? TFT_GREEN
+                     : (linkConnected ? TFT_CYAN
+                                      : (pairingMode ? TFT_YELLOW : TFT_DARKGREY)));
   uiCanvas.setTextColor(TFT_WHITE, 0x18E3);
   uiCanvas.setCursor(16, 60);
   if (connected) {
     uiCanvas.print("Connected");
+  } else if (linkConnected) {
+    uiCanvas.print("Securing");
   } else if (pairingMode) {
     uiCanvas.printf("Pairing %lus", pairRemainingMs / 1000UL);
   } else {
@@ -571,8 +795,10 @@ void drawStatus() {
 
   if (connected && gigglerEnabled) {
     uiCanvas.printf("Next move in %lus", nextMoveMs / 1000UL);
+  } else if (linkConnected) {
+    uiCanvas.print("Bonding...");
   } else if (pairingMode) {
-    uiCanvas.printf("Discoverable for %lus", pairRemainingMs / 1000UL);
+    uiCanvas.printf("Discoverable %lus", pairRemainingMs / 1000UL);
   } else if (connected) {
     uiCanvas.print("Connected and waiting");
   } else {
@@ -610,13 +836,14 @@ void stopGigglerMotion() {
 }
 
 void setPairingMode(const bool enabled) {
+  const bool wasPairingMode = pairingMode;
   pairingMode = enabled;
   pairingDeadlineMs = enabled ? millis() + kPairingWindowMs : 0;
   connectedSinceMs = 0;
 
   if (bleMouse.ready()) {
     if (enabled) {
-      if (!bleMouse.isConnected()) {
+      if (!bleMouse.hasLink()) {
         bleMouse.restartAdvertising();
       }
     } else {
@@ -628,7 +855,26 @@ void setPairingMode(const bool enabled) {
 }
 
 void handleConnectionState() {
+  const bool linkConnected = bleMouse.hasLink();
   const bool connected = bleMouse.isConnected();
+
+  if (linkConnected != wasLinkConnected) {
+    wasLinkConnected = linkConnected;
+
+    if (linkConnected) {
+      securityHandshakeDeadlineMs = millis() + kSecurityHandshakeTimeoutMs;
+      returnMovePending = false;
+    } else {
+      securityHandshakeDeadlineMs = 0;
+      connectedSinceMs = 0;
+      stopGigglerMotion();
+      if (pairingMode && bleMouse.ready()) {
+        bleMouse.setAdvertising(true);
+      }
+    }
+
+    displayDirty = true;
+  }
 
   if (connected == wasConnected) {
     return;
@@ -638,12 +884,13 @@ void handleConnectionState() {
 
   if (connected) {
     connectedSinceMs = millis();
+    securityHandshakeDeadlineMs = 0;
     returnMovePending = false;
     nextGiggleMs = millis() + kGiggleIntervalMs;
   } else {
     connectedSinceMs = 0;
     stopGigglerMotion();
-    if (pairingMode && bleMouse.ready()) {
+    if (pairingMode && bleMouse.ready() && !bleMouse.hasLink()) {
       bleMouse.setAdvertising(true);
     }
   }
@@ -710,8 +957,23 @@ void maintainScreenDimming() {
   }
 }
 
+void maintainSecureLink() {
+  if (!bleMouse.hasLink() || bleMouse.isConnected()) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (!pairingMode ||
+      (securityHandshakeDeadlineMs != 0 &&
+       timeReached(now, securityHandshakeDeadlineMs))) {
+    bleMouse.disconnect();
+    securityHandshakeDeadlineMs = now + kSecurityHandshakeTimeoutMs;
+    displayDirty = true;
+  }
+}
+
 void maintainPairingWindow() {
-  if (!pairingMode || bleMouse.isConnected()) {
+  if (!pairingMode || bleMouse.hasLink()) {
     return;
   }
 
@@ -797,8 +1059,6 @@ void setup() {
 
   loadBatteryCalibration();
   bleMouse.begin();
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P3);
-  esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV, ESP_PWR_LVL_P3);
   nextGiggleMs = millis() + kGiggleIntervalMs;
   lastUserActivityMs = millis();
   refreshBatteryStatus(lastUserActivityMs, true);
@@ -810,16 +1070,11 @@ void loop() {
 
   const uint32_t now = millis();
 
-  if (bleMouse.ready() && !initialAdvertisingStopped && !bleMouse.isConnected()) {
-    bleMouse.setAdvertising(false);
-    initialAdvertisingStopped = true;
-    displayDirty = true;
-  }
-
   handleConnectionState();
   handleButtons();
   maintainPairingWindow();
   maintainPairingLock();
+  maintainSecureLink();
   maintainScreenDimming();
   runGiggler();
 
