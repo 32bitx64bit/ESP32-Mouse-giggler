@@ -10,19 +10,20 @@
 
 namespace {
 
-constexpr uint32_t kActiveLoopDelayMs = 20;
-constexpr uint32_t kIdleLoopDelayMs = 100;
-constexpr uint32_t kDimmedLoopDelayMs = 60;
+constexpr uint32_t kActiveLoopDelayMs = 40;
+constexpr uint32_t kConnectedLoopDelayMs = 180;
+constexpr uint32_t kIdleLoopDelayMs = 250;
+constexpr uint32_t kDimmedLoopDelayMs = 350;
 constexpr uint32_t kPairHoldMs = 2000;
 constexpr uint32_t kPairingWindowMs = 60000;
 constexpr uint32_t kPairingLockDelayMs = 3000;
 constexpr uint32_t kSecurityHandshakeTimeoutMs = 15000;
 constexpr uint32_t kGiggleIntervalMs = 15000;
 constexpr uint32_t kReturnMoveDelayMs = 120;
-constexpr uint32_t kUiRefreshMs = 1000;
-constexpr uint32_t kUiRefreshSlowMs = 10000;
-constexpr uint32_t kBatterySampleMs = 10000;
-constexpr uint32_t kScreenDimTimeoutMs = 30000;
+constexpr uint32_t kUiRefreshMs = 10000;
+constexpr uint32_t kUiRefreshSlowMs = 60000;
+constexpr uint32_t kBatterySampleMs = 120000;
+constexpr uint32_t kScreenDimTimeoutMs = 10000;
 constexpr uint32_t kBondResetHoldMs = 5000;
 constexpr uint32_t kBatteryCalibrationSettleMs = 90000;
 constexpr uint32_t kBatteryCalibrationSaveMs = 21600000;
@@ -43,12 +44,12 @@ constexpr float kBatteryFallFilterAlpha = 0.35f;
 constexpr int8_t kGigglePixels = 1;
 constexpr uint8_t kScreenBrightLevel = 96;
 constexpr uint8_t kScreenDimLevel = 8;
-constexpr int8_t kBleTxPowerDbm = 0;
+constexpr int8_t kBleTxPowerDbm = -3;
 constexpr uint16_t kBleAppearanceMouse = 0x03C2;
-constexpr uint16_t kBleConnIntervalMin = 24;
-constexpr uint16_t kBleConnIntervalMax = 48;
-constexpr uint16_t kBleConnLatency = 4;
-constexpr uint16_t kBleConnTimeout = 200;
+constexpr uint16_t kBleConnIntervalMin = 72;
+constexpr uint16_t kBleConnIntervalMax = 96;
+constexpr uint16_t kBleConnLatency = 12;
+constexpr uint16_t kBleConnTimeout = 600;
 
 struct BatteryCurvePoint {
   int16_t voltageMv;
@@ -396,6 +397,7 @@ BatteryStatus batteryStatus;
 BatteryCalibration batteryCalibration;
 BatteryCalibration persistedBatteryCalibration;
 BatteryCalibrationRuntime batteryCalibrationRuntime;
+int32_t lastPublishedBatteryLevel = -1;
 
 void setScreenDimmed(const bool dimmed) {
   if (screenDimmed == dimmed) {
@@ -596,6 +598,8 @@ void refreshBatteryStatus(const uint32_t now, const bool force = false) {
     return;
   }
 
+  const int32_t previousLevel = batteryStatus.level;
+
   const int16_t batteryVoltageMv = M5.Power.getBatteryVoltage();
   const bool usbPowered = M5.Power.getVBUSVoltage() > 0;
 
@@ -634,7 +638,12 @@ void refreshBatteryStatus(const uint32_t now, const bool force = false) {
   batteryStatus.voltageMv = batteryVoltageMv;
   batteryStatus.usbPowered = usbPowered;
   if (bleMouse.ready() && batteryStatus.level >= 0) {
-    bleMouse.setBatteryLevel(static_cast<uint8_t>(constrain(batteryStatus.level, 0L, 100L)));
+    const uint8_t level =
+        static_cast<uint8_t>(constrain(batteryStatus.level, 0L, 100L));
+    const bool shouldNotify =
+        bleMouse.isConnected() && batteryStatus.level != previousLevel;
+    bleMouse.setBatteryLevel(level, shouldNotify);
+    lastPublishedBatteryLevel = batteryStatus.level;
   }
   nextBatterySampleMs = now + kBatterySampleMs;
 }
@@ -887,6 +896,12 @@ void handleConnectionState() {
     securityHandshakeDeadlineMs = 0;
     returnMovePending = false;
     nextGiggleMs = millis() + kGiggleIntervalMs;
+    if (batteryStatus.level >= 0) {
+      bleMouse.setBatteryLevel(
+          static_cast<uint8_t>(constrain(batteryStatus.level, 0L, 100L)),
+          true);
+      lastPublishedBatteryLevel = batteryStatus.level;
+    }
   } else {
     connectedSinceMs = 0;
     stopGigglerMotion();
@@ -1014,24 +1029,51 @@ void runGiggler() {
 }
 
 uint32_t computeLoopDelayMs(const uint32_t now) {
+  uint32_t maxDelayMs = kIdleLoopDelayMs;
+
   if (returnMovePending) {
-    return kActiveLoopDelayMs;
-  }
-
-  if (pairingMode || bleMouse.isConnected()) {
-    return kActiveLoopDelayMs;
-  }
-
-  if (screenDimmed) {
-    return kDimmedLoopDelayMs;
+    maxDelayMs = kActiveLoopDelayMs;
+  } else if (pairingMode || (bleMouse.hasLink() && !bleMouse.isConnected())) {
+    maxDelayMs = kActiveLoopDelayMs;
+  } else if (bleMouse.isConnected()) {
+    maxDelayMs = kConnectedLoopDelayMs;
+  } else if (screenDimmed) {
+    maxDelayMs = kDimmedLoopDelayMs;
   }
 
   const uint32_t screenDimAtMs = lastUserActivityMs + kScreenDimTimeoutMs;
-  const uint32_t untilDim = timeReached(now, screenDimAtMs)
-                               ? 0
-                               : (screenDimAtMs - now);
+  const uint32_t untilDim =
+      timeReached(now, screenDimAtMs) ? 0 : (screenDimAtMs - now);
 
-  return untilDim <= kIdleLoopDelayMs ? kActiveLoopDelayMs : kIdleLoopDelayMs;
+  uint32_t untilNextWorkMs = maxDelayMs;
+
+  if (returnMovePending) {
+    const uint32_t untilReturnMs =
+        timeReached(now, returnMoveMs) ? 0 : (returnMoveMs - now);
+    untilNextWorkMs = min(untilNextWorkMs, untilReturnMs);
+  } else if (gigglerEnabled && bleMouse.isConnected()) {
+    const uint32_t untilGiggleMs =
+        timeReached(now, nextGiggleMs) ? 0 : (nextGiggleMs - now);
+    untilNextWorkMs = min(untilNextWorkMs, untilGiggleMs);
+  }
+
+  if (!screenDimmed && nextUiRefreshMs != 0) {
+    const uint32_t untilUiRefreshMs =
+        timeReached(now, nextUiRefreshMs) ? 0 : (nextUiRefreshMs - now);
+    untilNextWorkMs = min(untilNextWorkMs, untilUiRefreshMs);
+  }
+
+  if (nextBatterySampleMs != 0) {
+    const uint32_t untilBatterySampleMs =
+        timeReached(now, nextBatterySampleMs) ? 0 : (nextBatterySampleMs - now);
+    untilNextWorkMs = min(untilNextWorkMs, untilBatterySampleMs);
+  }
+
+  if (!screenDimmed && untilDim <= untilNextWorkMs) {
+    return min(kActiveLoopDelayMs, untilDim);
+  }
+
+  return untilNextWorkMs;
 }
 
 }  // namespace
@@ -1039,11 +1081,16 @@ uint32_t computeLoopDelayMs(const uint32_t now) {
 void setup() {
   setCpuFrequencyMhz(80);
   auto cfg = M5.config();
+  cfg.internal_imu = false;
+  cfg.internal_mic = false;
+  cfg.internal_spk = false;
+  cfg.led_brightness = 0;
   M5.begin(cfg);
   WiFi.mode(WIFI_OFF);
   WiFi.disconnect(true, true);
   esp_wifi_deinit();
   esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
+  M5.Power.setLed(0);
   M5.Display.setRotation(1);
   M5.Display.setFont(&fonts::Font2);
   M5.Display.setBrightness(kScreenBrightLevel);
@@ -1081,9 +1128,12 @@ void loop() {
   refreshBatteryStatus(now);
 
   if (!screenDimmed && timeReached(now, nextUiRefreshMs)) {
-    const bool dynamicContent =
-        (bleMouse.isConnected() && gigglerEnabled) || pairingMode;
-    nextUiRefreshMs = now + (dynamicContent ? kUiRefreshMs : kUiRefreshSlowMs);
+    const uint32_t refreshMs = pairingMode
+                                   ? 1000
+                                   : ((bleMouse.isConnected() && gigglerEnabled)
+                                          ? kUiRefreshMs
+                                          : kUiRefreshSlowMs);
+    nextUiRefreshMs = now + refreshMs;
     displayDirty = true;
   }
 
