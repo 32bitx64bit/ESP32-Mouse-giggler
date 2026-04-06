@@ -6,7 +6,11 @@
 #include <esp_wifi.h>
 #include <esp_bt.h>
 #include <esp_system.h>
+#include <esp_sleep.h>
+#include <driver/gpio.h>
 #include <M5Unified.h>
+
+// #define DEBUG  // Uncomment to enable Serial output
 
 namespace {
 
@@ -43,13 +47,20 @@ constexpr float kBatteryRiseFilterAlpha = 0.18f;
 constexpr float kBatteryFallFilterAlpha = 0.35f;
 constexpr int8_t kGigglePixels = 1;
 constexpr uint8_t kScreenBrightLevel = 96;
-constexpr uint8_t kScreenDimLevel = 8;
+constexpr uint8_t kScreenDimLevel = 0;
 constexpr int8_t kBleTxPowerDbm = -3;
+constexpr int8_t kBleTxPowerConnectedDbm = -12;
 constexpr uint16_t kBleAppearanceMouse = 0x03C2;
 constexpr uint16_t kBleConnIntervalMin = 72;
 constexpr uint16_t kBleConnIntervalMax = 96;
 constexpr uint16_t kBleConnLatency = 12;
 constexpr uint16_t kBleConnTimeout = 600;
+constexpr uint16_t kBleConnIntervalIdleMin = 160;
+constexpr uint16_t kBleConnIntervalIdleMax = 320;
+constexpr uint16_t kBleConnLatencyIdle = 20;
+constexpr uint32_t kDeepSleepThresholdMs = 300000;
+constexpr uint32_t kBatterySampleDimmedMs = 300000;
+constexpr gpio_num_t kButtonAGpio = GPIO_NUM_37;
 
 struct BatteryCurvePoint {
   int16_t voltageMv;
@@ -253,6 +264,22 @@ class ManagedBleMouse {
     return inputReport_->notify(report, sizeof(report), connHandle_);
   }
 
+  void setConnectionParamsIdle(const bool idle) {
+    if (!server_ || connHandle_ == BLE_HS_CONN_HANDLE_NONE) {
+      return;
+    }
+
+    if (idle) {
+      server_->updateConnParams(connHandle_, kBleConnIntervalIdleMin,
+                                 kBleConnIntervalIdleMax, kBleConnLatencyIdle,
+                                 kBleConnTimeout);
+    } else {
+      server_->updateConnParams(connHandle_, kBleConnIntervalMin,
+                                 kBleConnIntervalMax, kBleConnLatency,
+                                 kBleConnTimeout);
+    }
+  }
+
  private:
   class ServerCallbacks : public NimBLEServerCallbacks {
    public:
@@ -407,6 +434,9 @@ void setScreenDimmed(const bool dimmed) {
   screenDimmed = dimmed;
   M5.Display.setBrightness(dimmed ? kScreenDimLevel : kScreenBrightLevel);
   displayDirty = true;
+  if (!dimmed) {
+    nextUiRefreshMs = 0;  // Force UI refresh recalculation when waking
+  }
 }
 
 void registerUserActivity() {
@@ -594,6 +624,7 @@ void updateBatteryCalibration(const uint32_t now, const int16_t batteryVoltageMv
 }
 
 void refreshBatteryStatus(const uint32_t now, const bool force = false) {
+  const uint32_t sampleInterval = screenDimmed ? kBatterySampleDimmedMs : kBatterySampleMs;
   if (!force && !timeReached(now, nextBatterySampleMs)) {
     return;
   }
@@ -645,7 +676,7 @@ void refreshBatteryStatus(const uint32_t now, const bool force = false) {
     bleMouse.setBatteryLevel(level, shouldNotify);
     lastPublishedBatteryLevel = batteryStatus.level;
   }
-  nextBatterySampleMs = now + kBatterySampleMs;
+  nextBatterySampleMs = now + (screenDimmed ? kBatterySampleDimmedMs : kBatterySampleMs);
 }
 
 void clearBondedDevices() {
@@ -737,12 +768,11 @@ void drawProgressBar(const int16_t x, const int16_t y, const int16_t w,
 }
 
 void drawStatus() {
-  if (!displayDirty) {
+  if (screenDimmed) {
     return;
   }
 
-  if (screenDimmed) {
-    displayDirty = false;
+  if (!displayDirty) {
     return;
   }
 
@@ -849,6 +879,7 @@ void setPairingMode(const bool enabled) {
   pairingMode = enabled;
   pairingDeadlineMs = enabled ? millis() + kPairingWindowMs : 0;
   connectedSinceMs = 0;
+  nextUiRefreshMs = 0;  // Force UI refresh recalculation
 
   if (bleMouse.ready()) {
     if (enabled) {
@@ -883,6 +914,7 @@ void handleConnectionState() {
     }
 
     displayDirty = true;
+    nextUiRefreshMs = 0;  // Force UI refresh recalculation
   }
 
   if (connected == wasConnected) {
@@ -892,6 +924,7 @@ void handleConnectionState() {
   wasConnected = connected;
 
   if (connected) {
+    NimBLEDevice::setPower(kBleTxPowerConnectedDbm);
     connectedSinceMs = millis();
     securityHandshakeDeadlineMs = 0;
     returnMovePending = false;
@@ -903,6 +936,7 @@ void handleConnectionState() {
       lastPublishedBatteryLevel = batteryStatus.level;
     }
   } else {
+    NimBLEDevice::setPower(kBleTxPowerDbm);
     connectedSinceMs = 0;
     stopGigglerMotion();
     if (pairingMode && bleMouse.ready() && !bleMouse.hasLink()) {
@@ -911,6 +945,7 @@ void handleConnectionState() {
   }
 
   displayDirty = true;
+  nextUiRefreshMs = 0;  // Force UI refresh recalculation
 }
 
 void handleButtons() {
@@ -923,7 +958,7 @@ void handleButtons() {
   }
 
   if (M5.BtnB.wasPressed()) {
-    lastUserActivityMs = millis();
+    registerUserActivity();
   }
 
   if (!pairingResetRequested && M5.BtnA.pressedFor(kBondResetHoldMs)) {
@@ -940,6 +975,7 @@ void handleButtons() {
       ignoreNextAClick = false;
     } else {
       gigglerEnabled = !gigglerEnabled;
+      bleMouse.setConnectionParamsIdle(!gigglerEnabled);
       stopGigglerMotion();
       displayDirty = true;
       registerUserActivity();
@@ -948,7 +984,7 @@ void handleButtons() {
 
   if (M5.BtnB.wasHold()) {
     setPairingMode(true);
-    lastUserActivityMs = millis();
+    registerUserActivity();
   }
 }
 
@@ -1101,8 +1137,10 @@ void setup() {
   uiCanvas.setFont(&fonts::Font2);
   uiCanvas.setTextWrap(false);
 
+#ifdef DEBUG
   Serial.begin(115200);
   Serial.println("Starting mouse giggler...");
+#endif
 
   loadBatteryCalibration();
   bleMouse.begin();
@@ -1139,5 +1177,25 @@ void loop() {
 
   drawStatus();
 
-  delay(computeLoopDelayMs(now));
+  // Deep sleep if isolated (no connection, no pairing mode) for extended time
+  if (!bleMouse.hasLink() && !pairingMode && !batteryStatus.usbPowered &&
+      timeReached(now, lastUserActivityMs + kDeepSleepThresholdMs)) {
+    M5.Display.sleep();
+    esp_sleep_enable_ext0_wakeup(kButtonAGpio, 0);  // Wake on button A press (LOW)
+    esp_deep_sleep_start();
+  }
+
+  // Use light sleep instead of delay() for power savings
+  // BUT: avoid light sleep when BLE has any active link - it breaks the radio
+  const uint32_t sleepMs = computeLoopDelayMs(now);
+  const bool bleActive = pairingMode || bleMouse.advertising() || bleMouse.hasLink();
+  if (sleepMs > 10 && !bleActive) {
+    esp_sleep_enable_timer_wakeup(static_cast<uint64_t>(sleepMs) * 1000ULL);
+    gpio_wakeup_enable(kButtonAGpio, GPIO_INTR_LOW_LEVEL);
+    gpio_wakeup_enable(GPIO_NUM_39, GPIO_INTR_LOW_LEVEL);  // Button B
+    esp_sleep_enable_gpio_wakeup();
+    esp_light_sleep_start();
+  } else {
+    delay(sleepMs);
+  }
 }
